@@ -1,66 +1,92 @@
 name: verify
 
-# Verifies the recipes one pull request to auscaster/ugt changes, with ugt from
-# auscaster/ugt's main, on clean amd64 and arm64 machines, and reports to the
-# catalogue service. Only the catalogue service and maintainers start it, from
-# this repository's main, so no pull request can change these steps; the
-# service trusts a report only from this workflow there, as the run's OIDC
-# token proves. Nothing here holds a secret or keeps a cache. Inputs are read
+# Verifies recipes with ugt from auscaster/ugt's main, on clean amd64 and arm64
+# machines, and reports to the catalogue service. Only the catalogue service and
+# maintainers start it, from this repository's main, so no pull request can
+# change these steps; the service trusts a report only from this workflow
+# there, as the run's OIDC token proves. It runs in one of two modes:
+#
+# - verify: the recipes one pull request changes, at its head. Nothing the run
+#   builds leaves it.
+# - publish: merged recipes, as main holds them. The run verifies them again and
+#   pushes the images it verified, unchanged, to ghcr.io/auscaster/ugt/recipes.
+#
+# Recipe code runs only in the verify job, whose token can do nothing: it takes
+# ugt and the recipes from the read job, and hands back its results (and, when
+# publishing, its images) as artifacts. Only jobs that run no recipe code read
+# auscaster/ugt, report or push. Nothing here keeps a cache. Inputs are read
 # through the environment, and checked before anything uses them.
 
 on:
   workflow_dispatch:
     inputs:
-      pull_request:
-        description: The pull request in auscaster/ugt
-        required: true
-      head:
-        description: Its head commit
-        required: true
+      mode:
+        description: Verify a pull request's head, or publish merged recipes from main
+        type: choice
+        options: [verify, publish]
+        default: verify
       recipes:
-        description: The recipes it changes, as a JSON list of IDs
+        description: The recipes, as a JSON list of IDs
         required: true
+      pull_request:
+        description: To verify, the pull request in auscaster/ugt
+        default: ""
+      head:
+        description: To verify, its head commit
+        default: ""
       approved:
-        description: A maintainer reviewed the access these recipes declare
+        description: To verify, a maintainer reviewed the access these recipes declare
         type: boolean
         default: false
 
-permissions:
-  contents: read
-  packages: write
-  id-token: write
+permissions: {}
 
 concurrency:
-  group: verify-${{ inputs.pull_request }}
-  cancel-in-progress: true
+  # a pull request's newer head replaces its older run; publishing runs never wait on each other
+  group: ${{ inputs.mode == 'verify' && format('verify-{0}', inputs.pull_request) || format('publish-{0}', github.run_id) }}
+  cancel-in-progress: ${{ inputs.mode == 'verify' }}
 
 env:
   SERVICE: https://api.usegithubthing.com
-  CANDIDATES: ghcr.io/auscaster/ugt-candidates
+  PACKAGE: ghcr.io/auscaster/ugt/recipes
 
 jobs:
   read:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      id-token: write
     outputs:
       stage: ${{ steps.read.outputs.stage }}
       verify: ${{ steps.read.outputs.verify }}
       ugt: ${{ steps.read.outputs.ugt }}
+      head: ${{ steps.read.outputs.head }}
     steps:
       - name: Check the inputs
         id: inputs
         env:
+          MODE: ${{ inputs.mode }}
+          RECIPES: ${{ inputs.recipes }}
           PULL_REQUEST: ${{ inputs.pull_request }}
           HEAD: ${{ inputs.head }}
-          RECIPES: ${{ inputs.recipes }}
+          APPROVED: ${{ inputs.approved }}
         run: |
           set -euo pipefail
-          [[ "$PULL_REQUEST" =~ ^[1-9][0-9]{0,9}$ ]] || { echo "pull_request is not a number"; exit 1; }
-          [[ "$HEAD" =~ ^[0-9a-f]{40}$ ]] || { echo "head is not a commit"; exit 1; }
+          case "$MODE" in
+            verify)
+              [[ "$PULL_REQUEST" =~ ^[1-9][0-9]{0,9}$ ]] || { echo "pull_request is not a number"; exit 1; }
+              [[ "$HEAD" =~ ^[0-9a-f]{40}$ ]] || { echo "head is not a commit"; exit 1; }
+              echo "ref=$HEAD" >> "$GITHUB_OUTPUT" ;;
+            publish)
+              [ -z "$PULL_REQUEST$HEAD" ] && [ "$APPROVED" = false ] || { echo "publishing reads main: give no pull request, head or approval"; exit 1; }
+              echo "ref=main" >> "$GITHUB_OUTPUT" ;;
+            *) echo "mode is verify or publish"; exit 1 ;;
+          esac
           jq -e 'type == "array" and length > 0 and length <= 20 and all(.[]; type == "string"
             and test("^[a-z0-9][a-z0-9._-]{0,99}/[a-z0-9][a-z0-9._-]{0,99}/[a-z0-9]+(-[a-z0-9]+)*$"))' <<< "$RECIPES" > /dev/null
           { echo "folders<<EOF"; jq -r '.[] | "recipes/" + .' <<< "$RECIPES"; echo EOF; } >> "$GITHUB_OUTPUT"
 
+      # UGT_READ_KEY is a read-only deploy key on auscaster/ugt, only while it is private
       - name: ugt, from auscaster/ugt's main
         uses: actions/checkout@v4
         with:
@@ -68,20 +94,20 @@ jobs:
           ref: main
           path: ugt
           persist-credentials: false
-          token: ${{ secrets.UGT_READ_TOKEN || github.token }} # only while auscaster/ugt is private
+          ssh-key: ${{ secrets.UGT_READ_KEY }}
           sparse-checkout: |
             /*
             !/recipes/
           sparse-checkout-cone-mode: false
 
-      - name: The recipes, from the pull request's head
+      - name: The recipes, from the pull request's head or main
         uses: actions/checkout@v4
         with:
           repository: auscaster/ugt
-          ref: ${{ inputs.head }}
+          ref: ${{ steps.inputs.outputs.ref }}
           path: head
           persist-credentials: false
-          token: ${{ secrets.UGT_READ_TOKEN || github.token }}
+          ssh-key: ${{ secrets.UGT_READ_KEY }}
           sparse-checkout: ${{ steps.inputs.outputs.folders }}
 
       - uses: actions/setup-go@v5
@@ -89,59 +115,78 @@ jobs:
           go-version-file: ugt/go.mod
           cache: false
 
-      - name: Build ugt
+      - name: Build ugt for both architectures
         working-directory: ugt
-        run: go build -o "$RUNNER_TEMP/ugt" ./cmd/ugt
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/work"
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -o "$RUNNER_TEMP/work/ugt-$arch" ./cmd/ugt
+          done
 
       - name: Read each recipe for admission
         id: read
         env:
+          MODE: ${{ inputs.mode }}
           RECIPES: ${{ inputs.recipes }}
           APPROVED: ${{ inputs.approved }}
         run: |
           set -euo pipefail
+          work="$RUNNER_TEMP/work"
           records='[]'
           while read -r id; do
             if [ -f "head/recipes/$id/recipe.json" ]; then
-              record=$("$RUNNER_TEMP/ugt" recipe validate --admit --json "head/recipes/$id" | jq -c '.[0]') || true
+              record=$("$work/ugt-amd64" recipe validate --admit --json "head/recipes/$id" | jq -c '.[0]') || true
+              mkdir -p "$work/recipes/$(dirname "$id")"
+              cp -a "head/recipes/$id" "$work/recipes/$id"
             else
               record=$(jq -nc --arg id "$id" '{recipe: $id, removed: true}')
             fi
             records=$(jq -c --argjson r "$record" '. + [$r]' <<< "$records")
           done < <(jq -r '.[]' <<< "$RECIPES")
-          printf '%s' "$records" > "$RUNNER_TEMP/records.json"
-          # every later job builds this same ugt, however main moves meanwhile
+          printf '%s' "$records" > "$work/records.json"
+          # every later job uses this same ugt and these same recipes, however main moves meanwhile
           echo "ugt=$(git -C ugt rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          gated=$(jq '[.[] | .gated // [] | .[]] | length' <<< "$records")
+          echo "head=$(git -C head rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           stage=verified
-          if [ "$gated" -gt 0 ] && [ "$APPROVED" != "true" ]; then stage=held; fi
+          if [ "$MODE" = publish ]; then
+            stage=published
+          elif [ "$(jq '[.[] | .gated // [] | .[]] | length' <<< "$records")" -gt 0 ] && [ "$APPROVED" != true ]; then
+            stage=held
+          fi
           echo "stage=$stage" >> "$GITHUB_OUTPUT"
           echo "verify=$(jq -c '[.[] | select((.removed | not) and ((.problems // []) | length == 0)) | .recipe]' <<< "$records")" >> "$GITHUB_OUTPUT"
           jq -r '.[] | "\(.recipe): \(if .removed then "removed" elif (.problems // []) | length > 0 then (.problems | join("; ")) else "revision \(.revision)" end)"' <<< "$records"
+          # an artifact keeps no file modes, and a recipe's scripts need theirs
+          tar -cf "$RUNNER_TEMP/work.tar" -C "$work" .
 
-      - name: Keep the records
+      - name: Hand ugt and the recipes to the later jobs
         uses: actions/upload-artifact@v4
         with:
-          name: records
-          path: ${{ runner.temp }}/records.json
+          name: work
+          path: ${{ runner.temp }}/work.tar
+          retention-days: 1
 
       - name: Report a held verification
         if: steps.read.outputs.stage == 'held'
         env:
-          PULL_REQUEST: ${{ inputs.pull_request }}
-          HEAD: ${{ inputs.head }}
           RUN: ${{ github.run_id }}
+          PULL_REQUEST: ${{ inputs.pull_request }}
+          HEAD: ${{ steps.read.outputs.head }}
+          UGT: ${{ steps.read.outputs.ugt }}
         run: |
           set -euo pipefail
-          jq -n --slurpfile records "$RUNNER_TEMP/records.json" --argjson run "$RUN" --argjson pr "$PULL_REQUEST" \
-            --arg head "$HEAD" --arg ugt "${{ steps.read.outputs.ugt }}" \
+          jq -n --slurpfile records "$RUNNER_TEMP/work/records.json" --argjson run "$RUN" --argjson pr "$PULL_REQUEST" \
+            --arg head "$HEAD" --arg ugt "$UGT" \
             '{format: "ugt-admission-v0", stage: "held", run: $run, pull_request: $pr, head: $head, ugt: $ugt, recipes: $records[0]}' > report.json
           token=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$SERVICE" | jq -r .value)
-          curl -sSf -X POST -H "Authorization: Bearer $token" -H "content-type: application/json" --data-binary @report.json "$SERVICE/v1/admission/reports"
+          curl -sSf --retry 4 --retry-all-errors --retry-delay 15 -X POST -H "Authorization: Bearer $token" \
+            -H "content-type: application/json" --data-binary @report.json "$SERVICE/v1/admission/reports"
 
   verify:
     needs: read
-    if: needs.read.outputs.stage == 'verified' && needs.read.outputs.verify != '[]'
+    if: needs.read.outputs.stage != 'held' && needs.read.outputs.verify != '[]'
+    permissions: {}
     strategy:
       fail-fast: false
       matrix:
@@ -150,117 +195,137 @@ jobs:
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 90
     steps:
-      - name: ugt, at the commit the read job built
-        uses: actions/checkout@v4
-        with:
-          repository: auscaster/ugt
-          ref: ${{ needs.read.outputs.ugt }}
-          path: ugt
-          persist-credentials: false
-          token: ${{ secrets.UGT_READ_TOKEN || github.token }}
-          sparse-checkout: |
-            /*
-            !/recipes/
-          sparse-checkout-cone-mode: false
-
-      - name: The recipe, from the pull request's head
-        uses: actions/checkout@v4
-        with:
-          repository: auscaster/ugt
-          ref: ${{ inputs.head }}
-          path: head
-          persist-credentials: false
-          token: ${{ secrets.UGT_READ_TOKEN || github.token }}
-          sparse-checkout: recipes/${{ matrix.recipe }}
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: ugt/go.mod
-          cache: false
-
-      - name: Build ugt
-        working-directory: ugt
-        run: go build -o "$RUNNER_TEMP/ugt" ./cmd/ugt
-
-      - name: Verify, and stage the verified images
+      - name: Name this result
         env:
           RECIPE: ${{ matrix.recipe }}
           ARCH: ${{ matrix.arch }}
-          ACTOR: ${{ github.actor }}
-          GH_TOKEN: ${{ github.token }}
+        run: echo "name=$(tr '/' '_' <<< "$RECIPE")-$ARCH" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: work
+          path: ${{ runner.temp }}
+
+      - name: Verify
+        env:
+          MODE: ${{ inputs.mode }}
+          RECIPE: ${{ matrix.recipe }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
+          work="$RUNNER_TEMP/work"
+          mkdir -p "$work" "out/$name"
+          tar -xf "$RUNNER_TEMP/work.tar" -C "$work"
           # the access a recipe declares is agreed here: verifying it is the point
-          "$RUNNER_TEMP/ugt" recipe verify --allow --json "head/recipes/$RECIPE" > report.json || true
+          "$work/ugt-$ARCH" recipe verify --allow --json "$work/recipes/$RECIPE" > report.json || true
           jq '{passed, seconds, steps: [.steps[] | {name, exit, seconds}]}' report.json
-          images='{}'
-          if [ "$(jq .passed report.json)" = true ]; then
+          jq -c --arg recipe "$RECIPE" --arg arch "$ARCH" \
+            '{recipe: $recipe, arch: $arch, passed: (.passed == true), seconds: (.seconds // 0), report: .}' report.json > "out/$name/result.json"
+          # publishing, each image the run verified goes to the report job exactly as it is
+          if [ "$MODE" = publish ] && [ "$(jq .passed report.json)" = true ]; then
             rev=$(jq -r .revision report.json)
-            docker login ghcr.io -u "$ACTOR" --password-stdin <<< "$GH_TOKEN"
             while read -r image; do
-              suffix="${image##*:"$rev"}"
-              target="$CANDIDATES:$rev$suffix-$ARCH"
-              docker tag "$image" "$target"
-              docker push --quiet "$target"
-              digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$target" | cut -d@ -f2)
-              images=$(jq -c --arg s "$suffix" --arg d "$digest" '. + {($s): $d}' <<< "$images")
+              docker save --output "out/$name/image${image##*:"$rev"}.tar" "$image"
             done < <(docker image ls --filter "label=com.usegithubthing.recipe=$RECIPE" --filter "label=com.usegithubthing.rev=$rev" \
               --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>' | sort -u)
           fi
-          jq -c --arg recipe "$RECIPE" --arg arch "$ARCH" --argjson images "$images" \
-            '{recipe: $recipe, arch: $arch, passed: (.passed == true), seconds: (.seconds // 0), report: ., images: $images}' report.json > result.json
-          echo "name=result-$(tr '/' '_' <<< "$RECIPE")-$ARCH" >> "$GITHUB_ENV"
 
-      - name: Keep the result
+      - name: Hand back the result
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.name }}
-          path: result.json
+          path: out/${{ env.name }}
           if-no-files-found: ignore
+          retention-days: 1
 
   report:
     needs: [read, verify]
-    if: always() && needs.read.outputs.stage == 'verified'
+    if: always() && needs.read.result == 'success' && needs.read.outputs.stage != 'held'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      packages: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Join each recipe's images, and report
+      - name: Unpack the records
+        run: tar -xf artifacts/work/work.tar ./records.json
+
+      # Each image goes into one OCI layout per recipe and suffix, its two architectures joined
+      # under one index, then pushed with every digest kept: the index digest reported is the one
+      # users pull.
+      - name: Publish each recipe that passed on both architectures
+        if: inputs.mode == 'publish'
         env:
-          PULL_REQUEST: ${{ inputs.pull_request }}
-          HEAD: ${{ inputs.head }}
-          RUN: ${{ github.run_id }}
-          UGT: ${{ needs.read.outputs.ugt }}
           ACTOR: ${{ github.actor }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          docker login ghcr.io -u "$ACTOR" --password-stdin <<< "$GH_TOKEN"
-          results=$(cat artifacts/result-*/result.json 2> /dev/null | jq -s '.')
-          out='[]'
-          while read -r record; do
-            id=$(jq -r .recipe <<< "$record")
-            mine=$(jq -c --arg id "$id" '[.[] | select(.recipe == $id)]' <<< "$results")
+          skopeo login ghcr.io -u "$ACTOR" --password-stdin <<< "$GH_TOKEN"
+          published='{}'
+          while read -r id; do
+            name=$(tr '/' '_' <<< "$id")
+            rev=$(jq -r --arg id "$id" '.[] | select(.recipe == $id) | .revision' records.json)
+            passed=$(cat artifacts/"$name"-amd64/result.json artifacts/"$name"-arm64/result.json 2> /dev/null | jq -s '[.[] | select(.passed)] | length')
+            [ "$passed" = 2 ] || continue
             images='{}'
-            # an image is staged once its recipe passed on both architectures
-            if [ "$(jq '[.[] | select(.passed)] | length' <<< "$mine")" = 2 ]; then
-              rev=$(jq -r .revision <<< "$record")
-              while IFS= read -r suffix; do
-                mapfile -t sources < <(jq -r --arg s "$suffix" --arg at "$CANDIDATES@" '.[] | .images[$s] // empty | $at + .' <<< "$mine")
-                [ "${#sources[@]}" = 2 ] || continue
-                docker buildx imagetools create --tag "$CANDIDATES:$rev$suffix" "${sources[@]}"
-                digest=$(docker buildx imagetools inspect "$CANDIDATES:$rev$suffix" --format '{{json .Manifest}}' | jq -r .digest)
-                images=$(jq -c --arg s "$suffix" --arg d "$digest" '. + {($s): {digest: $d, arches: ["amd64", "arm64"]}}' <<< "$images")
-              done < <(jq -r '[.[] | .images | keys[]] | unique | .[]' <<< "$mine")
-            fi
-            out=$(jq -c --argjson r "$record" --argjson m "$mine" --argjson images "$images" \
-              '. + [$r + {verified: [$m[] | {arch, passed, seconds, report}]} + (if $images == {} then {} else {images: $images} end)]' <<< "$out")
-          done < <(jq -c '.[]' artifacts/records/records.json)
-          jq -n --argjson recipes "$out" --argjson run "$RUN" --argjson pr "$PULL_REQUEST" --arg head "$HEAD" --arg ugt "$UGT" \
-            '{format: "ugt-admission-v0", stage: "verified", run: $run, pull_request: $pr, head: $head, ugt: $ugt, recipes: $recipes}' > report.json
+            for archive in artifacts/"$name"-amd64/image*.tar; do
+              [ -e "$archive" ] || continue
+              file=$(basename "$archive")
+              suffix=${file#image}
+              suffix=${suffix%.tar}
+              [ -f "artifacts/$name-arm64/$file" ] || { echo "$id has no arm64 $file"; exit 1; }
+              layout="$RUNNER_TEMP/layout"
+              rm -rf "$layout"
+              entries='[]'
+              for arch in amd64 arm64; do
+                skopeo copy --quiet "docker-archive:artifacts/$name-$arch/$file" "oci:$layout:$arch"
+                manifest=$(jq -c --arg a "$arch" '.manifests[] | select(.annotations["org.opencontainers.image.ref.name"] == $a) | {mediaType, digest, size}' "$layout/index.json")
+                config=$(jq -r .config.digest "$layout/blobs/sha256/$(jq -r '.digest | ltrimstr("sha256:")' <<< "$manifest")")
+                platform=$(jq -c '{architecture, os} + (if .variant then {variant} else {} end)' "$layout/blobs/sha256/${config#sha256:}")
+                [ "$(jq -r .architecture <<< "$platform")" = "$arch" ] || { echo "$id's $arch image is built for $platform"; exit 1; }
+                entries=$(jq -c --argjson m "$manifest" --argjson p "$platform" '. + [$m + {platform: $p}]' <<< "$entries")
+              done
+              jq -n -c -j --argjson m "$entries" '{schemaVersion: 2, mediaType: "application/vnd.oci.image.index.v1+json", manifests: $m}' > "$RUNNER_TEMP/index.json"
+              digest="sha256:$(sha256sum "$RUNNER_TEMP/index.json" | cut -d' ' -f1)"
+              cp "$RUNNER_TEMP/index.json" "$layout/blobs/sha256/${digest#sha256:}"
+              tag="$rev$suffix"
+              jq -n --arg d "$digest" --argjson s "$(wc -c < "$RUNNER_TEMP/index.json")" --arg t "$tag" \
+                '{schemaVersion: 2, manifests: [{mediaType: "application/vnd.oci.image.index.v1+json", digest: $d, size: $s,
+                  annotations: {"org.opencontainers.image.ref.name": $t}}]}' > "$layout/index.json"
+              skopeo copy --all --preserve-digests "oci:$layout:$tag" "docker://$PACKAGE:$tag"
+              pushed="sha256:$(skopeo inspect --raw "docker://$PACKAGE:$tag" | sha256sum | cut -d' ' -f1)"
+              [ "$pushed" = "$digest" ] || { echo "$PACKAGE:$tag arrived as $pushed, not $digest"; exit 1; }
+              echo "$PACKAGE:$tag is $digest"
+              images=$(jq -c --arg s "$suffix" --arg d "$digest" '. + {($s): {digest: $d, arches: ["amd64", "arm64"]}}' <<< "$images")
+            done
+            published=$(jq -c --arg id "$id" --argjson i "$images" '. + {($id): $i}' <<< "$published")
+          done < <(jq -r '.[] | select((.removed | not) and ((.problems // []) | length == 0)) | .recipe' records.json)
+          printf '%s' "$published" > published.json
+
+      - name: Report
+        env:
+          MODE: ${{ inputs.mode }}
+          STAGE: ${{ needs.read.outputs.stage }}
+          RUN: ${{ github.run_id }}
+          PULL_REQUEST: ${{ inputs.pull_request }}
+          HEAD: ${{ needs.read.outputs.head }}
+          UGT: ${{ needs.read.outputs.ugt }}
+        run: |
+          set -euo pipefail
+          results=$(cat artifacts/*/result.json 2> /dev/null | jq -s '.')
+          [ -f published.json ] || echo '{}' > published.json
+          recipes=$(jq -c --argjson results "$results" --slurpfile published published.json '[.[] | .recipe as $id
+            | . + {verified: [$results[] | select(.recipe == $id) | {arch, passed, seconds, report}]}
+            | if ($published[0][$id] // {}) == {} then . else . + {images: $published[0][$id]} end]' records.json)
+          jq -n --arg mode "$MODE" --arg stage "$STAGE" --argjson run "$RUN" --arg pr "$PULL_REQUEST" --arg head "$HEAD" \
+            --arg ugt "$UGT" --argjson recipes "$recipes" \
+            '{format: "ugt-admission-v0", stage: $stage, run: $run, head: $head, ugt: $ugt, recipes: $recipes}
+              + (if $mode == "verify" then {pull_request: ($pr | tonumber)} else {} end)' > report.json
           token=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$SERVICE" | jq -r .value)
-          curl -sSf -X POST -H "Authorization: Bearer $token" -H "content-type: application/json" --data-binary @report.json "$SERVICE/v1/admission/reports"
+          curl -sSf --retry 4 --retry-all-errors --retry-delay 15 -X POST -H "Authorization: Bearer $token" \
+            -H "content-type: application/json" --data-binary @report.json "$SERVICE/v1/admission/reports"
