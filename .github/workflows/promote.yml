@@ -1,0 +1,63 @@
+name: promote
+
+# Promotes the images verify.yml verified and staged, once their recipes have
+# merged: each is copied by digest from ghcr.io/auscaster/ugt-candidates to
+# ghcr.io/auscaster/ugt-recipes, read back to prove the digest did not change,
+# and reported to the catalogue service. Nothing is rebuilt, so users pull
+# exactly what was verified. Only the catalogue service starts it, from this
+# repository's main; it runs no recipe code.
+
+on:
+  workflow_dispatch:
+    inputs:
+      recipes:
+        description: The merged recipes' staged images, as JSON [{recipe, revision, images}]
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+env:
+  SERVICE: https://api.usegithubthing.com
+  CANDIDATES: ghcr.io/auscaster/ugt-candidates
+  RECIPES_PACKAGE: ghcr.io/auscaster/ugt-recipes
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Copy each image by digest, and report
+        env:
+          RECIPES: ${{ inputs.recipes }}
+          RUN: ${{ github.run_id }}
+          ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          jq -e 'type == "array" and length > 0 and length <= 20 and all(.[];
+            (.recipe | test("^[a-z0-9][a-z0-9._-]{0,99}/[a-z0-9][a-z0-9._-]{0,99}/[a-z0-9]+(-[a-z0-9]+)*$"))
+            and (.revision | test("^[0-9a-f]{12}$"))
+            and (.images | type == "object" and length > 0)
+            and all(.images | to_entries[]; (.key | test("^(|-[a-z0-9][a-z0-9-]*)$")) and (.value.digest | test("^sha256:[0-9a-f]{64}$"))))' \
+            <<< "$RECIPES" > /dev/null
+          skopeo login ghcr.io -u "$ACTOR" --password-stdin <<< "$GH_TOKEN"
+          while read -r image; do
+            revision=$(jq -r .revision <<< "$image")
+            suffix=$(jq -r .suffix <<< "$image")
+            digest=$(jq -r .digest <<< "$image")
+            target="$RECIPES_PACKAGE:$revision$suffix"
+            skopeo copy --all --preserve-digests "docker://$CANDIDATES@$digest" "docker://$target"
+            copied="sha256:$(skopeo inspect --raw "docker://$target" | sha256sum | cut -d' ' -f1)"
+            [ "$copied" = "$digest" ] || { echo "$target arrived as $copied, not $digest"; exit 1; }
+            echo "$target is $digest"
+          done < <(jq -c '.[] | .revision as $r | .images | to_entries[] | {revision: $r, suffix: .key, digest: .value.digest}' <<< "$RECIPES")
+          jq -n --argjson recipes "$RECIPES" --argjson run "$RUN" '{format: "ugt-promotion-v0", run: $run, recipes: $recipes}' > report.json
+          token=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$SERVICE" | jq -r .value)
+          curl -sSf -X POST -H "Authorization: Bearer $token" -H "content-type: application/json" --data-binary @report.json "$SERVICE/v1/admission/reports"
