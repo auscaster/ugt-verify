@@ -7,7 +7,9 @@ name: verify
 # there, as the run's OIDC token proves. It runs in one of two modes:
 #
 # - verify: the recipes one pull request changes, at its head. Nothing the run
-#   builds leaves it.
+#   builds leaves it. A recipe whose run revision (every file but recipe.json)
+#   the service already verified is read and reported, not run again: only its
+#   recipe.json changed.
 # - publish: merged recipes, as main holds them. The run verifies them again and
 #   pushes the images it verified, unchanged, to ghcr.io/auscaster/ugt/recipes.
 #
@@ -38,6 +40,9 @@ on:
         description: To verify, a maintainer reviewed the access these recipes declare
         type: boolean
         default: false
+      verified_runs:
+        description: To verify, the run revisions the service already verified, as a JSON list
+        default: "[]"
 
 permissions: {}
 
@@ -70,15 +75,17 @@ jobs:
           PULL_REQUEST: ${{ inputs.pull_request }}
           HEAD: ${{ inputs.head }}
           APPROVED: ${{ inputs.approved }}
+          VERIFIED_RUNS: ${{ inputs.verified_runs }}
         run: |
           set -euo pipefail
+          jq -e 'type == "array" and length <= 20 and all(.[]; type == "string" and test("^[0-9a-f]{12}$"))' <<< "$VERIFIED_RUNS" > /dev/null
           case "$MODE" in
             verify)
               [[ "$PULL_REQUEST" =~ ^[1-9][0-9]{0,9}$ ]] || { echo "pull_request is not a number"; exit 1; }
               [[ "$HEAD" =~ ^[0-9a-f]{40}$ ]] || { echo "head is not a commit"; exit 1; }
               echo "ref=$HEAD" >> "$GITHUB_OUTPUT" ;;
             publish)
-              [ -z "$PULL_REQUEST$HEAD" ] && [ "$APPROVED" = false ] || { echo "publishing reads main: give no pull request, head or approval"; exit 1; }
+              [ -z "$PULL_REQUEST$HEAD" ] && [ "$APPROVED" = false ] && [ "$VERIFIED_RUNS" = "[]" ] || { echo "publishing reads main: give no pull request, head, approval or verified runs"; exit 1; }
               echo "ref=main" >> "$GITHUB_OUTPUT" ;;
             *) echo "mode is verify or publish"; exit 1 ;;
           esac
@@ -130,6 +137,7 @@ jobs:
           MODE: ${{ inputs.mode }}
           RECIPES: ${{ inputs.recipes }}
           APPROVED: ${{ inputs.approved }}
+          VERIFIED_RUNS: ${{ inputs.verified_runs }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/work"
@@ -148,15 +156,19 @@ jobs:
           # every later job uses this same ugt and these same recipes, however main moves meanwhile
           echo "ugt=$(git -C ugt rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "head=$(git -C head rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # a recipe whose run the service verified changed only its recipe.json: nothing to run
+          verify=$(jq -c --argjson known "$VERIFIED_RUNS" '[.[] | select((.removed | not) and ((.problems // []) | length == 0)
+            and (.run as $r | $known | index($r) | not)) | .recipe]' <<< "$records")
           stage=verified
           if [ "$MODE" = publish ]; then
             stage=published
-          elif [ "$(jq '[.[] | .gated // [] | .[]] | length' <<< "$records")" -gt 0 ] && [ "$APPROVED" != true ]; then
+          elif [ "$(jq --argjson v "$verify" '[.[] | select(.recipe as $id | $v | index($id)) | .gated // [] | .[]] | length' <<< "$records")" -gt 0 ] && [ "$APPROVED" != true ]; then
             stage=held
           fi
           echo "stage=$stage" >> "$GITHUB_OUTPUT"
-          echo "verify=$(jq -c '[.[] | select((.removed | not) and ((.problems // []) | length == 0)) | .recipe]' <<< "$records")" >> "$GITHUB_OUTPUT"
-          jq -r '.[] | "\(.recipe): \(if .removed then "removed" elif (.problems // []) | length > 0 then (.problems | join("; ")) else "revision \(.revision)" end)"' <<< "$records"
+          echo "verify=$verify" >> "$GITHUB_OUTPUT"
+          jq -r --argjson v "$verify" '.[] | "\(.recipe): \(if .removed then "removed" elif (.problems // []) | length > 0 then (.problems | join("; "))
+            elif (.recipe as $id | $v | index($id)) then "revision \(.revision), run \(.run)" else "revision \(.revision): only recipe.json changed; run \(.run) was verified" end)"' <<< "$records"
           # an artifact keeps no file modes, and a recipe's scripts need theirs
           tar -cf "$RUNNER_TEMP/work.tar" -C "$work" .
 
@@ -223,10 +235,10 @@ jobs:
             '{recipe: $recipe, arch: $arch, passed: (.passed == true), seconds: (.seconds // 0), report: .}' report.json > "out/$name/result.json"
           # publishing, each image the run verified goes to the report job exactly as it is
           if [ "$MODE" = publish ] && [ "$(jq .passed report.json)" = true ]; then
-            rev=$(jq -r .revision report.json)
+            run=$(jq -r .run report.json)
             while read -r image; do
-              docker save --output "out/$name/image${image##*:"$rev"}.tar" "$image"
-            done < <(docker image ls --filter "label=com.usegithubthing.recipe=$RECIPE" --filter "label=com.usegithubthing.rev=$rev" \
+              docker save --output "out/$name/image${image##*:"$run"}.tar" "$image"
+            done < <(docker image ls --filter "label=com.usegithubthing.recipe=$RECIPE" --filter "label=com.usegithubthing.rev=$run" \
               --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>' | sort -u)
           fi
 
@@ -269,7 +281,7 @@ jobs:
           published='{}'
           while read -r id; do
             name=$(tr '/' '_' <<< "$id")
-            rev=$(jq -r --arg id "$id" '.[] | select(.recipe == $id) | .revision' records.json)
+            run=$(jq -r --arg id "$id" '.[] | select(.recipe == $id) | .run' records.json)
             passed=$(cat artifacts/"$name"-amd64/result.json artifacts/"$name"-arm64/result.json 2> /dev/null | jq -s '[.[] | select(.passed)] | length')
             [ "$passed" = 2 ] || continue
             images='{}'
@@ -293,7 +305,7 @@ jobs:
               jq -n -c -j --argjson m "$entries" '{schemaVersion: 2, mediaType: "application/vnd.oci.image.index.v1+json", manifests: $m}' > "$RUNNER_TEMP/index.json"
               digest="sha256:$(sha256sum "$RUNNER_TEMP/index.json" | cut -d' ' -f1)"
               cp "$RUNNER_TEMP/index.json" "$layout/blobs/sha256/${digest#sha256:}"
-              tag="$rev$suffix"
+              tag="$run$suffix"
               jq -n --arg d "$digest" --argjson s "$(wc -c < "$RUNNER_TEMP/index.json")" --arg t "$tag" \
                 '{schemaVersion: 2, manifests: [{mediaType: "application/vnd.oci.image.index.v1+json", digest: $d, size: $s,
                   annotations: {"org.opencontainers.image.ref.name": $t}}]}' > "$layout/index.json"
