@@ -257,7 +257,7 @@ jobs:
 
       # Each image goes into one OCI layout per recipe and suffix, its two architectures joined
       # under one index, then pushed with every digest kept: the index digest reported is the one
-      # users pull.
+      # users pull. A recipe that passed but builds nothing of its own is reported with no images.
       - name: Publish each recipe that passed on both architectures
         if: inputs.mode == 'publish'
         env:
@@ -321,7 +321,7 @@ jobs:
           [ -f published.json ] || echo '{}' > published.json
           recipes=$(jq -c --argjson results "$results" --slurpfile published published.json '[.[] | .recipe as $id
             | . + {verified: [$results[] | select(.recipe == $id) | {arch, passed, seconds, report}]}
-            | if ($published[0][$id] // {}) == {} then . else . + {images: $published[0][$id]} end]' records.json)
+            | if $published[0] | has($id) then . + {images: $published[0][$id]} else . end]' records.json)
           jq -n --arg mode "$MODE" --arg stage "$STAGE" --argjson run "$RUN" --arg pr "$PULL_REQUEST" --arg head "$HEAD" \
             --arg ugt "$UGT" --argjson recipes "$recipes" \
             '{format: "ugt-admission-v0", stage: $stage, run: $run, head: $head, ugt: $ugt, recipes: $recipes}
