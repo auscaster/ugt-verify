@@ -142,8 +142,13 @@ jobs:
           set -euo pipefail
           work="$RUNNER_TEMP/work"
           records='[]'
+          root=$(realpath -m head)
           while read -r id; do
-            if [ -f "head/recipes/$id/recipe.json" ]; then
+            # a recipe reached through a link is never read or copied: the link could point anywhere on
+            # this runner, such as this job's environment, which can mint its OIDC tokens
+            if [ "$(realpath -m "head/recipes/$id")" != "$root/recipes/$id" ]; then
+              record=$(jq -nc --arg id "$id" '{recipe: $id, problems: ["recipes/\($id) is reached through a link: a recipe holds only files and folders"]}')
+            elif [ -f "head/recipes/$id/recipe.json" ]; then
               record=$("$work/ugt-amd64" recipe validate --admit --json "head/recipes/$id" | jq -c '.[0]') || true
               mkdir -p "$work/recipes/$(dirname "$id")"
               cp -a "head/recipes/$id" "$work/recipes/$id"
@@ -338,7 +343,11 @@ jobs:
           UGT: ${{ needs.read.outputs.ugt }}
         run: |
           set -euo pipefail
-          results=$(cat artifacts/*/result.json 2> /dev/null | jq -s '.')
+          # no results when every recipe's run was verified before, and only its recipe.json changed
+          shopt -s nullglob
+          results='[]'
+          found=(artifacts/*/result.json)
+          if [ ${#found[@]} -gt 0 ]; then results=$(jq -s '.' "${found[@]}"); fi
           [ -f published.json ] || echo '{}' > published.json
           recipes=$(jq -c --argjson results "$results" --slurpfile published published.json '[.[] | .recipe as $id
             | . + {verified: [$results[] | select(.recipe == $id) | {arch, passed, seconds, report}]}
