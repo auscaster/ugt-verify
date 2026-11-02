@@ -239,7 +239,16 @@ jobs:
           layer=$("$ugt" version --json | jq -r .layer)
           docker run --detach --name layer --privileged --volume /var/lib/docker \
             --volume "$work:$work" --volume "$PWD/out:$PWD/out" \
-            --entrypoint /bin/sh "$layer" -c '/usr/local/bin/ugt-engine && exec sleep infinity'
+            --entrypoint /bin/sleep "$layer" infinity
+          # a container's cgroup is not the machine's root, so, as docker:dind
+          # does, the layer's processes move to a leaf and every controller is
+          # handed down, before anything else runs in it: otherwise no
+          # container with a memory or CPU limit starts
+          docker exec layer sh -euc '
+            [ -f /sys/fs/cgroup/cgroup.controllers ] || exit 0 # cgroup v1 nests as it is
+            mkdir -p /sys/fs/cgroup/init
+            xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs || : # one may have ended; a process left behind fails the next line
+            sed -e "s/ / +/g" -e "s/^/+/" < /sys/fs/cgroup/cgroup.controllers > /sys/fs/cgroup/cgroup.subtree_control'
           docker exec layer /usr/local/bin/ugt-engine
           inside() { docker exec --env HOME=/root layer "$@"; }
           # the access a recipe declares is agreed here: verifying it is the point
