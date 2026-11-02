@@ -93,7 +93,6 @@ jobs:
             and test("^[a-z0-9][a-z0-9._-]{0,99}/[a-z0-9][a-z0-9._-]{0,99}/[a-z0-9]+(-[a-z0-9]+)*$"))' <<< "$RECIPES" > /dev/null
           { echo "folders<<EOF"; jq -r '.[] | "recipes/" + .' <<< "$RECIPES"; echo EOF; } >> "$GITHUB_OUTPUT"
 
-      # UGT_READ_KEY is a read-only deploy key on auscaster/ugt, only while it is private
       - name: ugt, from auscaster/ugt's main
         uses: actions/checkout@v4
         with:
@@ -101,7 +100,6 @@ jobs:
           ref: main
           path: ugt
           persist-credentials: false
-          ssh-key: ${{ secrets.UGT_READ_KEY }}
           sparse-checkout: |
             /*
             !/recipes/
@@ -114,7 +112,6 @@ jobs:
           ref: ${{ steps.inputs.outputs.ref }}
           path: head
           persist-credentials: false
-          ssh-key: ${{ secrets.UGT_READ_KEY }}
           sparse-checkout: ${{ steps.inputs.outputs.folders }}
 
       - uses: actions/setup-go@v5
