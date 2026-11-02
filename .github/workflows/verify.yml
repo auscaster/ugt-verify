@@ -1,7 +1,7 @@
 name: verify
 
-# Verifies recipes with ugt from auscaster/ugt's main, on clean amd64 and arm64
-# machines, and reports to the catalogue service. Only the catalogue service and
+# Verifies recipes with ugt from auscaster/ugt's main, inside UGT's Linux layer
+# on clean amd64 and arm64 machines, and reports to the catalogue service. Only the catalogue service and
 # maintainers start it, from this repository's main, so no pull request can
 # change these steps; the service trusts a report only from this workflow
 # there, as the run's OIDC token proves. It runs in one of two modes:
@@ -228,8 +228,17 @@ jobs:
           work="$RUNNER_TEMP/work"
           mkdir -p "$work" "out/$name"
           tar -xf "$RUNNER_TEMP/work.tar" -C "$work"
+          ugt="$work/ugt-$ARCH"
+          # recipes run inside UGT's Linux layer, the one users' machines run, so
+          # a recipe is verified on exactly their engine, Compose and Buildx
+          layer=$("$ugt" version --json | jq -r .layer)
+          docker run --detach --name layer --privileged --volume /var/lib/docker \
+            --volume "$work:$work" --volume "$PWD/out:$PWD/out" \
+            --entrypoint /bin/sh "$layer" -c '/usr/local/bin/ugt-engine && exec sleep infinity'
+          docker exec layer /usr/local/bin/ugt-engine
+          inside() { docker exec --env HOME=/root layer "$@"; }
           # the access a recipe declares is agreed here: verifying it is the point
-          "$work/ugt-$ARCH" recipe verify --allow --json "$work/recipes/$RECIPE" > report.json || true
+          inside "$ugt" recipe verify --allow --json "$work/recipes/$RECIPE" > report.json || true
           jq '{passed, seconds, steps: [.steps[] | {name, exit, seconds}]}' report.json
           jq -c --arg recipe "$RECIPE" --arg arch "$ARCH" \
             '{recipe: $recipe, arch: $arch, passed: (.passed == true), seconds: (.seconds // 0), report: .}' report.json > "out/$name/result.json"
@@ -237,8 +246,8 @@ jobs:
           if [ "$MODE" = publish ] && [ "$(jq .passed report.json)" = true ]; then
             run=$(jq -r .run report.json)
             while read -r image; do
-              docker save --output "out/$name/image${image##*:"$run"}.tar" "$image"
-            done < <(docker image ls --filter "label=com.usegithubthing.recipe=$RECIPE" --filter "label=com.usegithubthing.rev=$run" \
+              inside docker save --output "$PWD/out/$name/image${image##*:"$run"}.tar" "$image"
+            done < <(inside docker image ls --filter "label=com.usegithubthing.recipe=$RECIPE" --filter "label=com.usegithubthing.rev=$run" \
               --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>' | sort -u)
           fi
 
