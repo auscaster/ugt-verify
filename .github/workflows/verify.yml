@@ -247,9 +247,12 @@ jobs:
             xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs || : # one may have ended; a process left behind fails the next line
             sed -e "s/ / +/g" -e "s/^/+/" < /sys/fs/cgroup/cgroup.controllers > /sys/fs/cgroup/cgroup.subtree_control'
           docker exec layer /usr/local/bin/ugt-engine
-          inside() { docker exec --env HOME=/root layer "$@"; }
+          # We already started the user's engine inside this layer. A runner with
+          # KVM must not make the helper try to boot another machine inside it.
+          inside() { docker exec --env HOME=/root --env UGT_RUNTIME=host layer "$@"; }
           # the access a recipe declares is agreed here: verifying it is the point
           inside "$ugt" recipe verify --allow --json "$work/recipes/$RECIPE" > report.json || true
+          jq -es 'length == 1 and (.[0].passed | type == "boolean")' report.json >/dev/null || { echo "ugt did not return a verification report" >&2; exit 1; }
           jq '{passed, seconds, steps: [.steps[] | {name, exit, seconds}]}' report.json
           jq -c --arg recipe "$RECIPE" --arg arch "$ARCH" \
             '{recipe: $recipe, arch: $arch, passed: (.passed == true), seconds: (.seconds // 0), report: .}' report.json > "out/$name/result.json"
