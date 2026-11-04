@@ -235,7 +235,7 @@ jobs:
           # a recipe is verified on exactly their engine, Compose and Buildx
           layer=$("$ugt" version --json | jq -r .layer)
           docker run --detach --name layer --privileged --volume /var/lib/docker \
-            --volume "$work:$work" --volume "$PWD/out:$PWD/out" \
+            --volume "$work:$work" \
             --entrypoint /bin/sleep "$layer" infinity
           # a container's cgroup is not the machine's root, so, as docker:dind
           # does, the layer's processes move to a leaf and every controller is
@@ -260,7 +260,8 @@ jobs:
           if [ "$MODE" = publish ] && [ "$(jq .passed report.json)" = true ]; then
             run=$(jq -r .run report.json)
             while read -r image; do
-              inside docker save --output "$PWD/out/$name/image${image##*:"$run"}.tar" "$image"
+              # Let the runner own the archive read by upload-artifact.
+              inside docker save "$image" > "out/$name/image${image##*:"$run"}.tar"
             done < <(inside docker image ls --filter "label=com.usegithubthing.recipe=$RECIPE" --filter "label=com.usegithubthing.rev=$run" \
               --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>' | sort -u)
           fi
